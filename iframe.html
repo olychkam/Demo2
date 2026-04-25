@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Liveness iframe message debug</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #0b1220;
+        color: #e5e7eb;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 12px;
+        align-items: center;
+      }
+      .row input:first-of-type {
+        flex: 1 1 220px;
+        min-width: 160px;
+      }
+      .row input#allowedOrigin {
+        flex: 0 1 200px;
+        min-width: 140px;
+      }
+      input, button {
+        border-radius: 8px;
+        border: 1px solid #334155;
+        background: #111827;
+        color: #e5e7eb;
+        padding: 10px 12px;
+        font-size: 14px;
+      }
+      button {
+        cursor: pointer;
+      }
+      iframe {
+        width: 100%;
+        height: calc(100vh - 180px); /* место под подсказки, поля, лог */
+        min-height: 640px;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        background: #000;
+      }
+      pre {
+        margin-top: 12px;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 12px;
+        background: #020617;
+        min-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .hint {
+        margin: 0 0 10px;
+        color: #94a3b8;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+      .ok {
+        color: #86efac;
+      }
+      .warn {
+        color: #fca5a5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <input
+        id="iframeUrl"
+        placeholder="https://biometric.spatium.io/?jwt=..."
+      />
+      <input id="allowedOrigin" placeholder="Allowed origin (* by default)" />
+      <button id="load">Load iframe</button>
+      <button id="clear">Clear logs</button>
+    </div>
+
+    <iframe
+      id="targetFrame"
+      title="Target iframe"
+      allow="camera *; microphone *; fullscreen *"
+      allowfullscreen
+    ></iframe>
+    <pre id="logs"></pre>
+
+    <script>
+      const iframeUrlInput = document.getElementById("iframeUrl");
+      const allowedOriginInput = document.getElementById("allowedOrigin");
+      const targetFrame = document.getElementById("targetFrame");
+      const logs = document.getElementById("logs");
+      const loadButton = document.getElementById("load");
+      const clearButton = document.getElementById("clear");
+      let parentMediaPrimed = false;
+
+      const params = new URLSearchParams(window.location.search);
+      const paramIframeUrl = params.get("iframeUrl") || "";
+      const paramAllowedOrigin = params.get("allowedOrigin") || "*";
+
+      iframeUrlInput.value = paramIframeUrl;
+      allowedOriginInput.value = paramAllowedOrigin;
+
+      const append = (line, kind) => {
+        if (!logs) return;
+        const ts = new Date().toISOString();
+        const prefix = kind === "warn"
+          ? "[WARN]"
+          : kind === "ok"
+          ? "[OK]"
+          : "[INFO]";
+        logs.textContent = `[${ts}] ${prefix} ${line}\n` + logs.textContent;
+      };
+
+      const stringify = (value) => {
+        if (typeof value === "string") return value;
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      };
+
+      const normalizePostMessageData = (raw) => {
+        if (typeof raw === "string") {
+          try {
+            return JSON.parse(raw);
+          } catch {
+            return raw;
+          }
+        }
+        return raw;
+      };
+
+      /** Spatium dispatches { payload, payloadJSON, destinations, parentTargetOrigin } — liveness fields are inside. */
+      const unwrapLivenessComplete = (data) => {
+        if (!data || typeof data !== "object") return null;
+        if (data.event === "liveness_complete") return data;
+        if (
+          data.payload && typeof data.payload === "object" &&
+          data.payload.event === "liveness_complete"
+        ) {
+          return data.payload;
+        }
+        if (typeof data.payloadJSON === "string") {
+          try {
+            const inner = JSON.parse(data.payloadJSON);
+            if (
+              inner && typeof inner === "object" &&
+              inner.event === "liveness_complete"
+            ) return inner;
+          } catch (_) {}
+        }
+        return null;
+      };
+
+      const syncUrlParams = () => {
+        const query = new URLSearchParams();
+        if (iframeUrlInput.value.trim()) {
+          query.set("iframeUrl", iframeUrlInput.value.trim());
+        }
+        if (allowedOriginInput.value.trim()) {
+          query.set("allowedOrigin", allowedOriginInput.value.trim());
+        }
+        history.replaceState(
+          null,
+          "",
+          `${location.pathname}?${query.toString()}`,
+        );
+      };
+
+      let lastLoadedIframeUrl = "";
+
+      const primeParentMediaPermissions = async () => {
+        if (parentMediaPrimed) {
+          return true;
+        }
+
+        if (!navigator.mediaDevices?.getUserMedia) {
+          append(
+            "Parent page cannot call getUserMedia in this browser/context.",
+            "warn",
+          );
+          return false;
+        }
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          stream.getTracks().forEach((track) => track.stop());
+          parentMediaPrimed = true;
+          append(
+            "Parent camera/microphone permission primed successfully.",
+            "ok",
+          );
+          return true;
+        } catch (error) {
+          append(
+            `Parent permission priming failed: ${stringify(error)}`,
+            "warn",
+          );
+          return false;
+        }
+      };
+
+      const loadFrame = async () => {
+        const url = iframeUrlInput.value.trim();
+        if (!url) {
+          append("Skip load: iframe URL is empty", "warn");
+          return;
+        }
+
+        if (
+          url === lastLoadedIframeUrl && targetFrame.getAttribute("src") === url
+        ) {
+          append(
+            "Skip reload: iframe already has this src (prevents repeated camera prompts in Firefox).",
+            "info",
+          );
+          return;
+        }
+
+        await primeParentMediaPermissions();
+
+        syncUrlParams();
+        targetFrame.src = url;
+        lastLoadedIframeUrl = url;
+        append(`iframe src set: ${url}`);
+      };
+
+      const isAllowedOrigin = (origin) => {
+        const allowed = allowedOriginInput.value.trim() || "*";
+        if (allowed === "*") return true;
+        return origin === allowed;
+      };
+
+      loadButton.addEventListener("click", () => {
+        loadFrame();
+      });
+      clearButton.addEventListener("click", () => {
+        if (logs) logs.textContent = "";
+      });
+
+      const logFullscreenState = (reason) => {
+        const active = document.fullscreenElement ? "entered" : "exited";
+        append(`fullscreen ${active} (${reason})`);
+      };
+
+      document.addEventListener("fullscreenchange", () => {
+        logFullscreenState("fullscreenchange");
+      });
+
+      document.addEventListener("fullscreenerror", (event) => {
+        append(`fullscreenerror: ${stringify(event)}`, "warn");
+      });
+
+      window.addEventListener("message", (event) => {
+        if (!isAllowedOrigin(event.origin)) {
+          append(`blocked message from origin=${event.origin}`, "warn");
+          return;
+        }
+
+        const data = normalizePostMessageData(event.data);
+        const dataText = stringify(data);
+        append(`message from origin=${event.origin}: ${dataText}`, "ok");
+
+        const liveness = unwrapLivenessComplete(data);
+        if (liveness) {
+          append(
+            `liveness_complete: success=${
+              String(liveness.success)
+            } error_code=${liveness.error_code ?? "-"} status=${
+              liveness.status ?? "-"
+            }`,
+            "ok",
+          );
+          if (
+            liveness.error_code === "CAMERA_ATTACH_FAILED" ||
+            liveness.status === 12
+          ) {
+            append(
+              "Note: CAMERA_ATTACH_FAILED / status=12 usually means camera permission denied or camera unavailable (expected user flow, not a random bug).",
+              "info",
+            );
+          }
+          if (
+            liveness.error_code === "SDK_INIT_FAILED" ||
+            String(liveness.details || "").includes("not supported")
+          ) {
+            append(
+              "Note: SDK_INIT_FAILED / FaceTec status 5 = unsupported or blocked environment (often insecure parent: use localhost/HTTPS, not http://LAN).",
+              "info",
+            );
+          }
+        }
+      });
+
+      targetFrame.addEventListener("load", () => {
+        append("iframe onload fired");
+      });
+
+      append("Parent listener is ready");
+      if (location.protocol === "file:") {
+        append(
+          "Warning: this page is opened via file://. Serve it from localhost or HTTPS for stable camera permissions in cross-origin iframe flows.",
+          "warn",
+        );
+      }
+      if (
+        typeof window.isSecureContext === "boolean" && !window.isSecureContext
+      ) {
+        append(
+          "Warning: not a secure context (window.isSecureContext=false). http://LAN-IP is not like localhost — FaceTec/camera in the iframe usually fail. Use http://localhost:PORT or HTTPS to the parent page.",
+          "warn",
+        );
+      }
+      if (iframeUrlInput.value.trim()) {
+        loadFrame();
+      }
+    </script>
+  </body>
+</html>
