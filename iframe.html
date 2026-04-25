@@ -83,6 +83,7 @@
       />
       <input id="allowedOrigin" placeholder="Allowed origin (* by default)" />
       <button id="load">Load iframe</button>
+      <button id="openTopLevel" style="display:none;">Open top-level</button>
       <button id="clear">Clear logs</button>
     </div>
 
@@ -100,8 +101,13 @@
       const targetFrame = document.getElementById("targetFrame");
       const logs = document.getElementById("logs");
       const loadButton = document.getElementById("load");
+      const openTopLevelButton = document.getElementById("openTopLevel");
       const clearButton = document.getElementById("clear");
       const REDIRECT_PATH = "/functions/v1/liveness-redirect";
+      const isFirefox = (() => {
+        const ua = navigator.userAgent;
+        return /Firefox\/\d+/i.test(ua) && !/Seamonkey/i.test(ua);
+      })();
 
       const params = new URLSearchParams(window.location.search);
       const paramIframeUrl = params.get("iframeUrl") || "";
@@ -260,6 +266,19 @@
         append(`iframe src set: ${finalIframeUrl}`);
       };
 
+      const openTopLevel = async () => {
+        const url = iframeUrlInput.value.trim();
+        if (!url) {
+          append("Skip open: iframe URL is empty", "warn");
+          return;
+        }
+
+        const finalIframeUrl = await resolveIframeUrlForFirefox(url);
+        syncUrlParams();
+        window.open(finalIframeUrl, "_blank", "noopener,noreferrer");
+        append(`Opened top-level verification URL: ${finalIframeUrl}`, "ok");
+      };
+
       const isAllowedOrigin = (origin) => {
         const allowed = allowedOriginInput.value.trim() || "*";
         if (allowed === "*") return true;
@@ -268,6 +287,9 @@
 
       loadButton.addEventListener("click", () => {
         loadFrame();
+      });
+      openTopLevelButton.addEventListener("click", () => {
+        openTopLevel();
       });
       clearButton.addEventListener("click", () => {
         if (logs) logs.textContent = "";
@@ -336,6 +358,13 @@
       });
 
       append("Parent listener is ready");
+      if (isFirefox) {
+        openTopLevelButton.style.display = "inline-block";
+        append(
+          "Firefox detected: prefer Open top-level to reduce repeated camera prompts in third-party iframe flows.",
+          "warn",
+        );
+      }
       if (location.protocol === "file:") {
         append(
           "Warning: this page is opened via file://. Serve it from localhost or HTTPS for stable camera permissions in cross-origin iframe flows.",
