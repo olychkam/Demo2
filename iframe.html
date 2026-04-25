@@ -101,7 +101,7 @@
       const logs = document.getElementById("logs");
       const loadButton = document.getElementById("load");
       const clearButton = document.getElementById("clear");
-      let parentMediaPrimed = false;
+      const REDIRECT_PATH = "/functions/v1/liveness-redirect";
 
       const params = new URLSearchParams(window.location.search);
       const paramIframeUrl = params.get("iframeUrl") || "";
@@ -139,6 +139,20 @@
           }
         }
         return raw;
+      };
+
+      const isNoisyBrowserExtensionMessage = (origin, data) => {
+        if (origin !== window.location.origin) {
+          return false;
+        }
+        if (typeof data === "string") {
+          return data === "SYN" || data === "ACK" ||
+            data.startsWith("cadesplugin_");
+        }
+        const target = data?.target;
+        const providerName = data?.data?.name;
+        return target === "metamask-inpage" || target === "metamask-contentscript" ||
+          providerName === "metamask-provider";
       };
 
       /** Spatium dispatches { payload, payloadJSON, destinations, parentTargetOrigin } — liveness fields are inside. */
@@ -180,37 +194,45 @@
 
       let lastLoadedIframeUrl = "";
 
-      const primeParentMediaPermissions = async () => {
-        if (parentMediaPrimed) {
-          return true;
-        }
-
-        if (!navigator.mediaDevices?.getUserMedia) {
-          append(
-            "Parent page cannot call getUserMedia in this browser/context.",
-            "warn",
-          );
-          return false;
-        }
-
+      const resolveIframeUrlForFirefox = async (inputUrl) => {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: true,
-          });
-          stream.getTracks().forEach((track) => track.stop());
-          parentMediaPrimed = true;
+          const parsed = new URL(inputUrl);
+          const isRedirectEndpoint =
+            parsed.pathname.endsWith(REDIRECT_PATH) &&
+            parsed.searchParams.has("ref");
+          if (!isRedirectEndpoint) {
+            return inputUrl;
+          }
+
+          const resolveUrl = new URL(parsed.toString());
+          resolveUrl.searchParams.set("resolve", "1");
+
+          const res = await fetch(resolveUrl.toString(), { method: "GET" });
+          if (!res.ok) {
+            append(
+              `Resolve mode failed (${res.status}). Loading redirect URL as-is.`,
+              "warn",
+            );
+            return inputUrl;
+          }
+
+          const payload = await res.json();
+          if (typeof payload?.iframeUrl !== "string" || !payload.iframeUrl) {
+            append(
+              "Resolve mode returned invalid iframeUrl. Loading redirect URL as-is.",
+              "warn",
+            );
+            return inputUrl;
+          }
+
           append(
-            "Parent camera/microphone permission primed successfully.",
+            `Resolved redirect URL to final iframe URL: ${payload.iframeUrl}`,
             "ok",
           );
-          return true;
+          return payload.iframeUrl;
         } catch (error) {
-          append(
-            `Parent permission priming failed: ${stringify(error)}`,
-            "warn",
-          );
-          return false;
+          append(`Resolve mode error: ${stringify(error)}`, "warn");
+          return inputUrl;
         }
       };
 
@@ -230,13 +252,12 @@
           );
           return;
         }
-
-        await primeParentMediaPermissions();
+        const finalIframeUrl = await resolveIframeUrlForFirefox(url);
 
         syncUrlParams();
-        targetFrame.src = url;
+        targetFrame.src = finalIframeUrl;
         lastLoadedIframeUrl = url;
-        append(`iframe src set: ${url}`);
+        append(`iframe src set: ${finalIframeUrl}`);
       };
 
       const isAllowedOrigin = (origin) => {
@@ -266,12 +287,16 @@
       });
 
       window.addEventListener("message", (event) => {
+        const data = normalizePostMessageData(event.data);
+        if (isNoisyBrowserExtensionMessage(event.origin, data)) {
+          return;
+        }
+
         if (!isAllowedOrigin(event.origin)) {
           append(`blocked message from origin=${event.origin}`, "warn");
           return;
         }
 
-        const data = normalizePostMessageData(event.data);
         const dataText = stringify(data);
         append(`message from origin=${event.origin}: ${dataText}`, "ok");
 
